@@ -1,0 +1,19 @@
+# Sensitive Environment Variables
+.env
+.env.local
+.env.*
+!.env.example
+
+# Python Virtual Environments & Cache
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Node / Next.js
+node_modules/
+.next/
+
+# IDE & OS Files
+.vscode/
+.DS_Store
