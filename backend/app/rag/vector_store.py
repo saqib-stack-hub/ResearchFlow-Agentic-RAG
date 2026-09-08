@@ -1,209 +1,182 @@
 """
-ResearchFlow AI — Qdrant Vector Store
-Persistent vector database wrapper with collection management.
+ResearchFlow AI — Vector Store Interface
+Handles Async Qdrant interaction.
 """
-from typing import Any, Dict, List, Optional, Tuple
-from qdrant_client import QdrantClient, AsyncQdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue, ScoredPoint
-)
+from typing import List, Optional, Tuple, Dict, Any
 from langchain_core.documents import Document
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models
+
 from app.core.config import settings
 from app.core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-_async_client: Optional[AsyncQdrantClient] = None
-_sync_client: Optional[QdrantClient] = None
+# Singleton Qdrant Client Instance
+_qdrant_client: Optional[AsyncQdrantClient] = None
 
 
-def get_sync_client() -> QdrantClient:
-    """Get synchronous Qdrant client (for setup/health checks)."""
-    global _sync_client
-    if _sync_client is None:
-        kwargs = {"url": settings.VECTOR_DB_URL}
-        if settings.VECTOR_DB_API_KEY:
-            kwargs["api_key"] = settings.VECTOR_DB_API_KEY
-        _sync_client = QdrantClient(**kwargs)
-    return _sync_client
+def get_qdrant_client() -> AsyncQdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        # In-Memory Mode: Docker / External Qdrant Server ki zaroorat nahi hai
+        _qdrant_client = AsyncQdrantClient(location=":memory:", check_compatibility=False)
+    return _qdrant_client
 
 
-def get_async_client() -> AsyncQdrantClient:
-    """Get asynchronous Qdrant client."""
-    global _async_client
-    if _async_client is None:
-        kwargs = {"url": settings.VECTOR_DB_URL}
-        if settings.VECTOR_DB_API_KEY:
-            kwargs["api_key"] = settings.VECTOR_DB_API_KEY
-        _async_client = AsyncQdrantClient(**kwargs)
-    return _async_client
+async def check_vector_db_health() -> bool:
+    """Check health status of Qdrant connection."""
+    client = get_qdrant_client()
+    try:
+        await client.get_collections()
+        return True
+    except Exception as e:
+        logger.error("qdrant_health_check_failed", error=str(e))
+        return False
 
 
-async def ensure_collection_exists() -> None:
-    """Create the Qdrant collection if it doesn't exist."""
-    client = get_async_client()
-    collection_name = settings.VECTOR_DB_COLLECTION
-
+async def ensure_collection_exists(collection_name: str = "documents_384_v1", vector_size: int = 384):
+    """Ensure that the Qdrant collection exists on server startup."""
+    client = get_qdrant_client()
     try:
         collections = await client.get_collections()
-        existing = [c.name for c in collections.collections]
-
-        if collection_name not in existing:
+        exists = any(c.name == collection_name for c in collections.collections)
+        if not exists:
             await client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=settings.EMBEDDING_DIMENSION,
-                    distance=Distance.COSINE,
-                ),
+                vectors_config=models.VectorParams(
+                    size=vector_size,
+                    distance=models.Distance.COSINE
+                )
             )
             logger.info("collection_created", collection=collection_name)
         else:
             logger.info("collection_exists", collection=collection_name)
     except Exception as e:
-        logger.error("collection_setup_failed", error=str(e))
-        raise
+        logger.error("qdrant_init_failed", error=str(e))
 
 
-async def upsert_chunks(chunks: List[Document], vectors: List[List[float]]) -> int:
-    """
-    Upsert document chunks with their embeddings into Qdrant.
-    Returns the number of points upserted.
-    """
-    client = get_async_client()
-    collection_name = settings.VECTOR_DB_COLLECTION
-
-    points = []
-    for chunk, vector in zip(chunks, vectors):
-        chunk_id = chunk.metadata.get("chunk_id")
-        # Use deterministic ID from chunk_id (convert to int for Qdrant)
-        point_id = _chunk_id_to_int(chunk_id)
-
-        points.append(PointStruct(
-            id=point_id,
-            vector=vector,
-            payload={
+async def upsert_chunks(
+    chunks: List[Document],
+    vectors: List[List[float]],
+    collection_name: str = "documents_384_v1",
+) -> bool:
+    """Upsert document chunks and vectors into Qdrant."""
+    client = get_qdrant_client()
+    try:
+        points = []
+        for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+            payload = {
                 "page_content": chunk.page_content,
-                "document_id": chunk.metadata.get("document_id", ""),
-                "filename": chunk.metadata.get("filename", ""),
-                "file_type": chunk.metadata.get("file_type", ""),
-                "page": chunk.metadata.get("page", 0),
-                "chunk_id": chunk_id,
-                "chunk_index": chunk.metadata.get("chunk_index", 0),
-                "char_count": chunk.metadata.get("char_count", 0),
-                "upload_timestamp": chunk.metadata.get("upload_timestamp", ""),
+                **chunk.metadata,
             }
-        ))
+            point_id = payload.get("chunk_id", f"{payload.get('document_id', 'doc')}_{idx}")
+            points.append(
+                models.PointStruct(
+                    id=point_id,
+                    vector=vector,
+                    payload=payload,
+                )
+            )
 
-    if not points:
-        return 0
+        await client.upsert(
+            collection_name=collection_name,
+            points=points,
+        )
+        logger.info("chunks_upserted", count=len(points), collection=collection_name)
+        return True
+    except Exception as e:
+        logger.error("qdrant_upsert_error", error=str(e))
+        return False
 
-    # Batch upsert in groups of 100
-    batch_size = 100
-    total = 0
-    for i in range(0, len(points), batch_size):
-        batch = points[i:i + batch_size]
-        await client.upsert(collection_name=collection_name, points=batch)
-        total += len(batch)
 
-    logger.info("chunks_upserted", count=total, collection=collection_name)
-    return total
+async def delete_document_chunks(
+    document_id: str,
+    collection_name: str = "documents_384_v1",
+) -> bool:
+    """Delete all chunks related to a specific document ID."""
+    client = get_qdrant_client()
+    try:
+        await client.delete(
+            collection_name=collection_name,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="document_id",
+                            match=models.MatchValue(value=document_id),
+                        )
+                    ]
+                )
+            ),
+        )
+        logger.info("document_chunks_deleted", document_id=document_id)
+        return True
+    except Exception as e:
+        logger.error("qdrant_delete_error", error=str(e))
+        return False
 
 
 async def similarity_search(
     query_vector: List[float],
-    top_k: int = None,
-    score_threshold: float = None,
+    top_k: int = 4,
+    score_threshold: float = 0.0,
     document_ids: Optional[List[str]] = None,
 ) -> List[Tuple[Document, float]]:
-    """
-    Semantic similarity search in Qdrant.
-    Returns list of (Document, score) tuples.
-    """
-    client = get_async_client()
-    top_k = top_k or settings.TOP_K
-    score_threshold = score_threshold or settings.SIMILARITY_THRESHOLD
+    """Search vector database using query vector with client compatibility."""
+    client = get_qdrant_client()
+    collection_name = getattr(settings, "QDRANT_COLLECTION", "documents_384_v1")
 
-    # Build filter for specific documents if provided
     query_filter = None
     if document_ids:
-        query_filter = Filter(
+        query_filter = models.Filter(
             must=[
-                FieldCondition(
+                models.FieldCondition(
                     key="document_id",
-                    match=MatchValue(value=doc_id),
+                    match=models.MatchAny(any=document_ids),
                 )
-                for doc_id in document_ids
             ]
         )
 
-    results: List[ScoredPoint] = await client.search(
-        collection_name=settings.VECTOR_DB_COLLECTION,
-        query_vector=query_vector,
-        limit=top_k,
-        score_threshold=score_threshold,
-        query_filter=query_filter,
-        with_payload=True,
-    )
-
-    docs_with_scores = []
-    for hit in results:
-        payload = hit.payload or {}
-        doc = Document(
-            page_content=payload.get("page_content", ""),
-            metadata={k: v for k, v in payload.items() if k != "page_content"},
-        )
-        docs_with_scores.append((doc, hit.score))
-
-    return docs_with_scores
-
-
-async def delete_document_chunks(document_id: str) -> int:
-    """Delete all chunks for a specific document from Qdrant."""
-    client = get_async_client()
-    collection_name = settings.VECTOR_DB_COLLECTION
-
-    result = await client.delete(
-        collection_name=collection_name,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=document_id),
-                )
-            ]
-        ),
-    )
-    logger.info("chunks_deleted", document_id=document_id)
-    return getattr(result, "deleted_count", 0)
-
-
-async def get_collection_info() -> Dict[str, Any]:
-    """Get info about the Qdrant collection."""
     try:
-        client = get_async_client()
-        info = await client.get_collection(settings.VECTOR_DB_COLLECTION)
-        return {
-            "vectors_count": info.vectors_count,
-            "points_count": info.points_count,
-            "status": str(info.status),
-        }
+        if hasattr(client, "query_points"):
+            response = await client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=query_filter,
+                with_payload=True,
+            )
+            search_results = response.points
+        else:
+            search_results = await client.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                limit=top_k,
+                score_threshold=score_threshold if score_threshold > 0 else None,
+                query_filter=query_filter,
+                with_payload=True,
+            )
+
+        results = []
+        for point in search_results:
+            payload = point.payload or {}
+            page_content = payload.get("page_content", "")
+            
+            doc = Document(
+                page_content=page_content,
+                metadata={
+                    "document_id": payload.get("document_id"),
+                    "chunk_id": payload.get("chunk_id"),
+                    "filename": payload.get("filename"),
+                    "page_number": payload.get("page_number"),
+                }
+            )
+            results.append((doc, float(point.score)))
+
+        return results
+
     except Exception as e:
-        return {"error": str(e)}
-
-
-async def check_vector_db_health() -> bool:
-    """Check if Qdrant is healthy."""
-    try:
-        client = get_async_client()
-        await client.get_collections()
-        return True
-    except Exception:
-        return False
-
-
-def _chunk_id_to_int(chunk_id: str) -> int:
-    """Convert UUID string to an integer for Qdrant point ID."""
-    import hashlib
-    h = hashlib.md5(chunk_id.encode()).hexdigest()
-    return int(h[:16], 16)  # Use first 16 hex chars as int (fits in uint64)
+        logger.error("qdrant_search_error", error=str(e))
+        return []

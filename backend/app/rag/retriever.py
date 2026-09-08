@@ -1,12 +1,6 @@
 """
 ResearchFlow AI — Advanced Retrieval
 Hybrid BM25 + Vector search with MMR diversity filtering.
-
-Strategy:
-  1. Dense vector search (Qdrant semantic similarity)
-  2. BM25 keyword search (sparse retrieval)
-  3. Reciprocal Rank Fusion to merge results
-  4. MMR for diversity (removes near-duplicate chunks)
 """
 import math
 from hashlib import md5
@@ -23,7 +17,6 @@ from app.rag.vector_store import similarity_search
 logger = get_logger(__name__)
 
 # In-memory BM25 index per document corpus
-# For production scale, consider a dedicated BM25 service
 _bm25_corpus: List[Document] = []
 _bm25_index: Optional[BM25Okapi] = None
 
@@ -31,9 +24,7 @@ _bm25_index: Optional[BM25Okapi] = None
 def update_bm25_index(documents: List[Document]) -> None:
     """Update the in-memory BM25 index with new documents."""
     global _bm25_corpus, _bm25_index
-    # Add new documents to corpus
     _bm25_corpus.extend(documents)
-    # Rebuild index
     tokenized = [_tokenize(doc.page_content) for doc in _bm25_corpus]
     if tokenized:
         _bm25_index = BM25Okapi(tokenized)
@@ -55,8 +46,8 @@ async def hybrid_retrieve(
     Hybrid retrieval: combines vector search + BM25 via Reciprocal Rank Fusion (RRF).
     Falls back gracefully to pure vector search if BM25 index is empty.
     """
-    top_k = top_k or settings.TOP_K
-    similarity_threshold = similarity_threshold or settings.SIMILARITY_THRESHOLD
+    top_k = top_k or getattr(settings, "TOP_K", 4)
+    similarity_threshold = similarity_threshold or getattr(settings, "SIMILARITY_THRESHOLD", 0.2)
 
     with LatencyTracker("hybrid_retrieve", logger) as tracker:
         # 1. Vector (semantic) search
@@ -64,7 +55,7 @@ async def hybrid_retrieve(
         vector_results = await similarity_search(
             query_vector=query_vector,
             top_k=top_k * 2,  # Over-retrieve for fusion
-            score_threshold=max(0.0, similarity_threshold - 0.1),
+            score_threshold=0.0,  # Fetch raw results first for RRF
             document_ids=document_ids,
         )
 
@@ -72,13 +63,15 @@ async def hybrid_retrieve(
         bm25_results = _bm25_search(query, top_k * 2) if _bm25_index else []
 
         # 3. Reciprocal Rank Fusion
-        if bm25_results:
+        if bm25_results and vector_results:
             fused = _reciprocal_rank_fusion(vector_results, bm25_results, k=60)
         else:
             fused = vector_results
 
-        # 4. Apply similarity threshold
-        filtered = [(doc, score) for doc, score in fused if score >= similarity_threshold]
+        # 4. Safe Filtering (Do not drop all documents if RRF score is low)
+        filtered = [(doc, score) for doc, score in fused if score >= (similarity_threshold * 0.5)]
+        if not filtered and fused:
+            filtered = fused[:top_k]  # Fallback to top fused candidates
 
         # 5. MMR for diversity
         diverse = mmr_rerank(query_vector, filtered, top_k=top_k, lambda_mult=0.7)
@@ -104,7 +97,6 @@ def _bm25_search(query: str, top_k: int) -> List[Tuple[Document, float]]:
     tokens = _tokenize(query)
     scores = _bm25_index.get_scores(tokens)
 
-    # Sort by score descending
     ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
 
     results = []
@@ -112,7 +104,6 @@ def _bm25_search(query: str, top_k: int) -> List[Tuple[Document, float]]:
         if scores[idx] > 0:
             results.append((_bm25_corpus[idx], float(scores[idx])))
 
-    # Normalize BM25 scores to [0, 1]
     if results:
         max_score = results[0][1]
         if max_score > 0:
@@ -128,7 +119,6 @@ def _reciprocal_rank_fusion(
 ) -> List[Tuple[Document, float]]:
     """
     Reciprocal Rank Fusion (RRF) to merge two ranked lists.
-    RRF score = sum(1 / (k + rank_i)) for each list.
     """
     scores: dict = {}
     doc_map: dict = {}
@@ -148,7 +138,6 @@ def _reciprocal_rank_fusion(
 
     sorted_keys = sorted(scores, key=scores.get, reverse=True)
 
-    # Normalize to [0, 1]
     max_score = scores[sorted_keys[0]] if sorted_keys else 1.0
     return [(doc_map[k], scores[k] / max_score) for k in sorted_keys]
 
@@ -161,7 +150,6 @@ def mmr_rerank(
 ) -> List[Tuple[Document, float]]:
     """
     Maximum Marginal Relevance (MMR) for diversity.
-    Balances relevance (lambda_mult) against diversity (1 - lambda_mult).
     """
     if not candidates or top_k <= 0:
         return candidates
@@ -169,19 +157,15 @@ def mmr_rerank(
     if len(candidates) <= top_k:
         return candidates
 
-    # We need embeddings for MMR — use score as proxy for cosine similarity
     selected = []
     remaining = list(candidates)
 
     while len(selected) < top_k and remaining:
         if not selected:
-            # First selection: highest relevance
             best = max(remaining, key=lambda x: x[1])
         else:
-            # Subsequent: balance relevance vs. diversity from already selected
             def mmr_score(candidate: Tuple[Document, float]) -> float:
                 doc, rel_score = candidate
-                # Approximate diversity as 1 - max_overlap with selected
                 max_sim = max(
                     _text_overlap(doc.page_content, sel_doc.page_content)
                     for sel_doc, _ in selected

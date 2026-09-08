@@ -14,7 +14,6 @@ from sqlalchemy import select, func, desc
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.logging_config import get_logger
-from app.core.redis_client import get_document_status
 from app.models.document import Document, DocumentStatus, DocumentType
 from app.models.schemas import (
     DocumentResponse, DocumentListResponse, DocumentDeleteResponse,
@@ -46,7 +45,7 @@ async def upload_document(
 ):
     """
     Upload a PDF, DOCX, or TXT document.
-    Processing runs in the background — poll /documents for status.
+    Processing runs in the background via FastAPI BackgroundTasks.
     """
     # Validate file type
     file_type = get_file_type(file.filename or "unknown.txt")
@@ -88,7 +87,7 @@ async def upload_document(
     await db.commit()
     await db.refresh(doc)
 
-    # Queue background processing
+    # Queue background processing (Redis-Bypassed Direct Task)
     background_tasks.add_task(
         process_document,
         str(document_id),
@@ -146,7 +145,6 @@ async def list_documents(
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     """Get real dashboard statistics from the database."""
-    # Total documents by status
     status_counts = {}
     for status in DocumentStatus:
         result = await db.execute(
@@ -157,7 +155,6 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     total_docs = sum(status_counts.values())
     total_chunks = await get_total_chunks(db)
 
-    # Total chat sessions
     from app.models.chat import ChatSession
     sessions_result = await db.execute(select(func.count()).select_from(ChatSession))
     total_sessions = sessions_result.scalar() or 0
@@ -177,18 +174,22 @@ async def get_document_status_endpoint(
     document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get real-time document processing status (from Redis cache)."""
-    # Try Redis first for real-time status
-    redis_status = await get_document_status(str(document_id))
-    if redis_status:
-        return DocumentStatusResponse(
-            document_id=document_id,
-            status=redis_status.get("status", "unknown"),
-            progress_step=redis_status.get("step"),
-            error_message=redis_status.get("error") or None,
-        )
+    """Get document status directly from the Database (Redis-Safe fallback)."""
+    # Safe Redis lookup with immediate Database fallback
+    try:
+        from app.core.redis_client import get_document_status
+        redis_status = await get_document_status(str(document_id))
+        if redis_status:
+            return DocumentStatusResponse(
+                document_id=document_id,
+                status=redis_status.get("status", "unknown"),
+                progress_step=redis_status.get("step"),
+                error_message=redis_status.get("error") or None,
+            )
+    except Exception as e:
+        logger.warning("redis_status_check_failed_fallback_to_db", error=str(e))
 
-    # Fall back to database
+    # Always fallback to direct DB lookup
     result = await db.execute(select(Document).where(Document.id == document_id))
     doc = result.scalar_one_or_none()
     if not doc:
@@ -207,10 +208,7 @@ async def delete_document_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Delete a document from:
-    - PostgreSQL (metadata)
-    - Qdrant (vector chunks)
-    - Disk (uploaded file)
+    Delete a document from PostgreSQL, Qdrant, and local Disk.
     """
     deleted = await delete_document(str(document_id), db)
     if not deleted:

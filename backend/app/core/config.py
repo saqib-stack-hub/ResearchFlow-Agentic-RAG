@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # ── Vector Database (Qdrant) ─────────────────────────────────
     VECTOR_DB_URL: str = "http://localhost:6333"
-    VECTOR_DB_COLLECTION: str = "researchflow_docs"
+    VECTOR_DB_COLLECTION: str = "researchflow_docs_v3"
     VECTOR_DB_API_KEY: Optional[str] = None
 
     # ── LLM ──────────────────────────────────────────────────────
@@ -59,9 +59,9 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = None
 
     # ── Embeddings ───────────────────────────────────────────────
-    EMBEDDING_PROVIDER: str = "openai"
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSION: int = 1536
+    EMBEDDING_PROVIDER: str = "huggingface"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    EMBEDDING_DIMENSION: int = 384
     HUGGINGFACE_API_KEY: Optional[str] = None
 
     # ── RAG Configuration ─────────────────────────────────────────

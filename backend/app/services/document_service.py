@@ -42,17 +42,28 @@ async def process_document(
 ) -> None:
     """
     Full document processing pipeline (runs as background task).
-    Updates document status in both Redis (real-time) and PostgreSQL (persistent).
+    Updates document status in both Redis (real-time with fallback) and PostgreSQL (persistent).
     """
     async def update_status(status: DocumentStatus, step: str = "", error: str = ""):
-        """Update status in both DB and Redis."""
+        """Update status in DB and safely try Redis."""
+        # 1. Always update persistent PostgreSQL database
         await _update_document_status_db(db, document_id, status, error)
-        await set_document_status(document_id, {
-            "status": status.value,
-            "step": step,
-            "error": error,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
+
+        # 2. Try Redis update; catch exception if Redis service is unavailable/down
+        try:
+            await set_document_status(document_id, {
+                "status": status.value,
+                "step": step,
+                "error": error,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as redis_err:
+            logger.warning(
+                "redis_status_update_failed_bypassed",
+                document_id=document_id,
+                error=str(redis_err),
+            )
+
         logger.info("document_status_update", document_id=document_id, status=status.value, step=step)
 
     try:
